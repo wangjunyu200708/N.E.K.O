@@ -28,6 +28,7 @@ from ._shared import (
     VisualDeliveryMode,
     _IMAGE_ANALYSIS_PENDING_DESCRIPTION,
     asyncio,
+    realtime_wire_trace_enabled,
     response_arbiter_fail_open_enabled,
     soxr,
 )
@@ -35,6 +36,8 @@ from ._shared import (
 
 
 from ._shared import canonical_realtime_dialect
+from ._shared import logger as _transport_logger
+from ._wire_trace import RealtimeWireTrace
 from ._tools import _ToolingMixin
 from ._audio import _AudioMixin
 from ._transport import _TransportMixin
@@ -206,12 +209,19 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         # Teardown owns the socket it detached, so a cancelled caller cannot
         # strand it. Both close paths run as one task per connection and every
         # caller awaits it through a shield: cancelling the caller stops the
-        # waiting, never the closing, and a retry re-awaits the same task
-        # instead of finding ``self.ws`` already None and returning happy.
+        # waiting, never the closing. An in-flight retry re-awaits the same
+        # task; a completed failure keeps its detached transport for a fresh
+        # close attempt instead of finding ``self.ws`` already None and
+        # returning happy.
         # Reset by connect(), because the client object outlives a connection.
         self._close_task = None
         self._failed_transport_close_task = None
         self._gemini_close_task = None
+        self._gemini_close_retry_contexts: dict[int, tuple[Any, Any]] = {}
+        # A provider close can fail after the socket has been detached from
+        # ``self.ws``. Keep that physical owner until a later close retry
+        # confirms release; connect() must not discard this uncertainty.
+        self._retired_websockets: list[Any] = []
         # A replacement can reset the connection-wide close latch while the
         # retired Gemini context is still exiting. Keep a separate latch per
         # context so every path joins the same one-shot ``__aexit__`` call.
@@ -262,12 +272,30 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
                 livestream_mode=bool(livestream_mode),
             )
         )
+        # Read once per construction, like the fail-open hatch: a change needs
+        # a restart. Off leaves the transport and the arbiter untouched.
+        self._wire_trace_enabled = realtime_wire_trace_enabled()
+        self._wire_trace = (
+            RealtimeWireTrace(_transport_logger) if self._wire_trace_enabled else None
+        )
         self._response_arbiter = RealtimeResponseArbiter(
             self.send_event,
             abort_transport=self._abort_failed_transport,
             fail_open=response_arbiter_fail_open_enabled(),
             on_stuck_release=self._on_arbiter_stuck_release,
             protocol_capabilities=self._realtime_protocol_capabilities,
+            trace=self._wire_trace_enabled,
+            # Stamp arbiter records with the wire records' client tag and
+            # live connection generation so an offline reader can key both
+            # to the same connection.
+            trace_tag=(
+                self._wire_trace.client_tag if self._wire_trace is not None else None
+            ),
+            trace_generation=(
+                (lambda: getattr(self, "_connection_generation", None))
+                if self._wire_trace_enabled
+                else None
+            ),
         )
         # Track printing state for input and output transcripts
         self._is_first_text_chunk = False
@@ -514,8 +542,9 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         #           (no call_id — synthesize from response_id+output_index)
         #   step  → nested schema, response.function_call_arguments.done event
         #   free  (lanlan.tech proxies StepFun) → same as step. lanlan.app
-        #          proxies Vertex Live and is NOT plumbed yet (server side
-        #          strips tools); see TODO in core.py.
+        #          proxies Vertex Live; it forwards the session.update tools
+        #          list and emits response.function_call_arguments.* events
+        #          (observed 2026-09-07 minecraft_task, 2026-09-12 recall_memory).
         #   qwen  → no custom tool calling per Aliyun docs (only enable_search)
         #   gemini → genai SDK config.tools, response.tool_call.function_calls
         # The provider-side flags below let event handlers cheaply route.

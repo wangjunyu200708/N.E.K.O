@@ -30,7 +30,7 @@ from urllib.parse import urlsplit
 
 from PIL import Image
 
-from config import MONITOR_SERVER_PORT, USER_NOTIFICATION_ERROR_MAX_CHARS
+from config import USER_NOTIFICATION_ERROR_MAX_CHARS
 from main_logic import core, cross_server
 from main_logic.agent_event_bus import notify_analyze_ack
 from main_logic.proactive_delivery import (
@@ -652,21 +652,9 @@ class RoleState:
       later by websocket_router / _init_character_resources respectively.
 
     Legacy fields: ``sync_shutdown_event: ThreadEvent`` and ``sync_process:
-    Thread`` are semantically gone since cross_server merged into the main event
-    loop (no separate thread anymore). Lifecycle is now managed by ``sync_task:
+    Thread`` are gone since cross_server merged into the main event loop (no
+    separate thread anymore). Lifecycle is now managed by ``sync_task:
     asyncio.Task``, with shutdown via ``task.cancel()``.
-
-    However, ``main_routers/shared_state.py``'s ``_RoleStateFieldView`` still
-    exposes dict-like views for ``sync_shutdown_event`` / ``sync_process``
-    (the public router APIs ``get_sync_shutdown_event()`` /
-    ``get_sync_process()``). The view's ``__getitem__`` uses
-    ``getattr(rs, field)`` (no default) and would raise ``AttributeError`` if
-    the field didn't exist. Keeping these two ``Optional[Any] = None``
-    placeholder fields preserves the shim's "always-empty dict" semantics:
-    ``__contains__`` sees None and returns False, ``__getitem__`` goes to
-    ``raise KeyError``, and every caller gets a consistent empty state instead
-    of a crash. The two fields are never assigned anymore; remove them once
-    it's confirmed nothing external depends on them.
     """
 
     sync_message_queue: _SyncMessageQueue
@@ -676,9 +664,6 @@ class RoleState:
     # 用 Any 而非 core.LLMSessionManager：避免 dataclass 运行时求值 annotation
     # 时踩到 forward-ref / 循环引用边界
     session_manager: Optional[Any] = None
-    # 仅为 main_routers/shared_state.py 的 legacy field-view 提供占位；永远 None
-    sync_shutdown_event: Optional[Any] = None
-    sync_process: Optional[Any] = None
 
 
 # 角色名 -> RoleState 的主存储；所有 per-k 同步资源都通过它访问
@@ -914,6 +899,12 @@ async def _handle_agent_event(event: dict):
     try:
         event_type = event.get("event_type")
         lanlan = event.get("lanlan_name")
+
+        if event_type == "plugin_card":
+            from main_logic.plugin_cards import deliver_plugin_card
+            default_name, _ = _select_fallback_session_manager()
+            await deliver_plugin_card(event, dict(_iter_session_managers()), default_name)
+            return
 
         if event_type == "analyze_ack":
             logger.info(
@@ -1922,6 +1913,15 @@ async def _init_character_resources(k: str, is_new_character: bool):
                 new_mgr.user_language = old_user_language
                 new_mgr._user_language_explicit = True
 
+            # 新 manager 的 ToolRegistry 只有内置工具：把插件等远端注册重放进来，
+            # 否则保存配置 / 改音色之后插件工具会静默消失（见 tool_router 的台账注释）。
+            try:
+                from main_routers.tool_router import replay_remote_tools
+
+                replay_remote_tools(new_mgr, k)
+            except Exception as e:
+                logger.warning(f"重放 {k} 的远端工具注册失败: {e}")
+
             # 恢复websocket引用（如果存在）
             if old_websocket:
                 new_mgr.websocket = old_websocket
@@ -2000,9 +2000,8 @@ async def _init_character_resources(k: str, is_new_character: bool):
                 cross_server.run_sync_connector(
                     rs.sync_message_queue,
                     k,
-                    f"ws://127.0.0.1:{MONITOR_SERVER_PORT}",
-                    {"bullet": False, "monitor": True},
-                    _status_cb,
+                    config={"bullet": False, "monitor": True},
+                    status_callback=_status_cb,
                     user_language_provider=(
                         lambda _name=k: _get_explicit_session_user_language(_name)
                     ),
@@ -2061,6 +2060,14 @@ def _cleanup_character_dicts(k: str):
         pass
     # 一次 del 原子清掉所有 6 个字段 —— 替代旧代码里 6 张 dict 分别 del 的对称清理
     del role_state[k]
+    # 与重建分支的 replay_remote_tools 对偶：槽位没了，该角色的 scoped 工具记录和
+    # 全局记录上的排除项也得清掉，否则之后同名的新角色（含改名成这个名字）会继承。
+    try:
+        from main_routers.tool_router import forget_role
+
+        forget_role(k)
+    except Exception as e:
+        logger.warning(f"清理 {k} 的远端工具台账失败: {e}")
 
 
 async def _unregister_character_voice_identity_manager(k: str) -> None:
