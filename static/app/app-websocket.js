@@ -2835,6 +2835,8 @@
         S.socket.onopen = function () {
             if (S.socket !== _thisSocket) return;
             console.log(window.t('console.websocketConnected'));
+            // The state module publishes read errors; reconnect must remain usable.
+            window.appChatAvatarState?.refresh('reconnect')?.catch?.(() => {});
 
             if (S._conversationLanguageClearPending) {
                 var pendingLanguageClear = S._conversationLanguageClearPending;
@@ -3127,6 +3129,19 @@
 
             try {
                 var response = JSON.parse(event.data);
+                // 串门帧（visit_*）统一再派发一份给 static/visit/ 下的脚本（口型 / pacer）；
+                // 只派发、不 return，各类型的处理分支照常往下走
+                if (typeof response.type === 'string' && response.type.indexOf('visit_') === 0) {
+                    try {
+                        window.dispatchEvent(new CustomEvent('neko-visit-frame', { detail: response }));
+                    } catch (_) { /* noop */ }
+                }
+                // Persistent display resources do not belong to the assistant stream
+                // or model-preview IPC pipeline; invalidate even while a turn is gated.
+                if (response.type === 'chat_avatar_changed') {
+                    window.appChatAvatarState?.onBackendChanged(response);
+                    return;
+                }
                 if (response.type === 'catgirl_switched') {
                     console.log(window.t('console.catgirlSwitchedReceived'), response);
                 }
@@ -3577,7 +3592,10 @@
                     if (!Number.isFinite(playbackGain)) playbackGain = 1;
                     playbackGain = Math.max(0, Math.min(2, playbackGain));
 
-                    if (speechId && S.interruptedSpeechId && speechId === S.interruptedSpeechId) {
+                    if (speechId && ((S.interruptedSpeechId && speechId === S.interruptedSpeechId) ||
+                        (window.appAudioPlayback &&
+                            typeof window.appAudioPlayback.isAssistantSpeechInterrupted === 'function' &&
+                            window.appAudioPlayback.isAssistantSpeechInterrupted(speechId)))) {
                         if (window.DEBUG_AUDIO) {
                             console.log(window.t('console.discardInterruptedAudio'), speechId);
                         }
@@ -3643,6 +3661,13 @@
                     logAssistantLifecycle('ws:audio_done', {
                         speechId: response.speech_id || null
                     });
+                    // 按 speech_id 的附加派发（串门 pacer 据此判一行的结束标记，
+                    // docs/design/visit-infrastructure.md §4.5 visit_speech_progress）；播放器逻辑不变
+                    try {
+                        window.dispatchEvent(new CustomEvent('neko-audio-stream-closed', {
+                            detail: { speechId: response.speech_id || null }
+                        }));
+                    } catch (_) { /* noop */ }
                     if (window.appAudioPlayback &&
                         typeof window.appAudioPlayback.noteAssistantAudioStreamClosed === 'function') {
                         window.appAudioPlayback.noteAssistantAudioStreamClosed(response.speech_id);
@@ -6014,6 +6039,10 @@
             S.independentAsrActive = false;
             S.independentAsrProvider = '';
             clearAssistantLifecycleOnDisconnect('socket_close');
+            if (window.appAudioPlayback &&
+                typeof window.appAudioPlayback.clearLocalAssistantSpeechInterruptions === 'function') {
+                window.appAudioPlayback.clearLocalAssistantSpeechInterruptions(_thisSocket);
+            }
 
             // Clear heartbeat
             if (S.heartbeatInterval) {

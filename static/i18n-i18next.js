@@ -29,8 +29,8 @@
     const SUPPORTED_LANGUAGES = ['zh-CN', 'zh-TW', 'en', 'ja', 'ko', 'ru', 'es', 'pt'];
 
     // locale 资源版本（用于 cache-busting，避免客户端长期缓存旧语言包导致新增 key 不生效）
-    // 合并消息表情、已有音色导入与上游八语文案，刷新客户端缓存。
-    const LOCALE_VERSION = '2026-10-07-message-reactions-voice-import-merge';
+    // 云下载「改名数据分不开」提示带上两个角色名（本分支）与串门 PR-13/15 文案（上游）合并，刷新八语言客户端缓存。
+    const LOCALE_VERSION = '2026-10-12-visit-ambiguous-names-pr13-pr15-merge';
     function initDecorativeImageDragGuard() {
         const markImage = (img) => {
             if (!(img instanceof HTMLImageElement)) return;

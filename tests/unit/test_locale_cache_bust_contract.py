@@ -65,6 +65,44 @@ LOCALE_VERSION_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}-[a-z0-9][a-z0-9._-]*$")
 # 递增 LOCALE_VERSION 时，把旧值追加到这里。
 RETIRED_LOCALE_VERSIONS = frozenset(
     {
+        "2026-10-11-visit-data-ambiguous-names",
+        "2026-10-11-visit-pr13-pr15-report-queued-login",
+        "2026-10-11-visit-data-ambiguous",
+        "2026-10-11-visit-data-busy-rename-text",
+        "2026-10-11-pr3385-cloudsave-visit-data-busy",
+        "2026-10-11-visit-pr13-pr15-settings-memory-panel",
+        "2026-10-11-visit-pr13-pr15-forget-record-discard",
+        "2026-10-11-pngtuber-skipped-bound-memory-toggle-main-merge",
+        "2026-10-10-pngtuber-delete-skipped-bound",
+        "2026-10-09-memory-toggle-repair",
+        "2026-10-09-pr3340-avatar-wake-hints-rebase",
+        "2026-10-09-pr3345-wake-repair-hints",
+        "2026-10-09-chat-avatar-storage-hardening-rebase",
+        "2026-10-09-custom-chat-avatar-main-rebase",
+        "2026-10-07-custom-chat-avatar",
+        "2026-10-09-storage-hardening-prepared-recovery",
+        "2026-10-09-pr3349-main-rebase",
+        "2026-10-08-voice-enrollment-duration",
+        "2026-10-09-pr3349-rebase-storage-hardening",
+        "2026-10-09-pr3345-rebase-storage-hardening",
+        "2026-10-09-pr3345-main-rebase",
+        "2026-10-09-pr3345-resource-repair-hints",
+        "2026-10-09-pr3345-resource-first-retest",
+        "2026-10-09-pr3345-resource-location-copy",
+        "2026-10-09-pr3345-duration-layout-rebase",
+        "2026-10-08-voice-identity-resource-help",
+        "2026-10-08-voice-identity-input-guidance",
+        "2026-10-08-voice-identity-input-layout",
+        "2026-10-09-storage-hardening-main-merge",
+        "2026-10-08-storage-v1-catch-up-skipped",
+        "2026-10-08-unknown-unlock-prepared-recovery",
+        "2026-10-08-storage-stage-unreadable",
+        "2026-10-08-storage-commit-ambiguous",
+        "2026-10-07-storage-publish-conflict",
+        "2026-10-07-storage-source-missing",
+        "2026-10-07-storage-cleanup-incomplete",
+        "2026-10-07-message-reactions-voice-import-merge-prepared-recovery",
+        "2026-10-07-message-reactions-voice-import-merge",
         "2026-10-07-message-reactions-image-save-merge",
         "2026-10-07-pr3305-image-save-rebase",
         "2026-10-07-message-reactions-main-merge",
@@ -135,6 +173,8 @@ RETIRED_LOCALE_VERSIONS = frozenset(
         "2026-10-03-assist-model-id-removal",
         "2026-10-03-model-picker-url-hint",
         "2026-10-03-assist-model-picker",
+        "2026-10-03-theater-air-basketball-main-merge",
+        "2026-10-03-model-picker-main-merge-round5",
         "2026-10-03-requesty-air-basketball-main-merge",
         "2026-10-01-click-guide-memory-reactivation",
         "2026-10-01-click-guide-review-main-merge",
@@ -367,7 +407,7 @@ RETIRED_LOCALE_VERSIONS = frozenset(
 #
 # 数组也按下标展开，所以往 badminton.lines.* 这类台词数组里追加一条同样会打红：
 # 陈旧缓存下那一条会取到 undefined，症状和缺 key 是一类。
-LOCALE_KEY_SIGNATURE = '7e2942cf9ff57156079222a23a0d4782d5e4a0574328c78fd58d15119e814ef9'
+LOCALE_KEY_SIGNATURE = '848cdbf15eabe1e0012a06405d65bf379a69aa73fe12c5e6036f81e9b33af0a8'
 
 _BUMP_INSTRUCTIONS = (
     "static/locales 的 key 结构变了。请在 static/i18n-i18next.js 里把 LOCALE_VERSION "
