@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Process-wide serialization for every read and write of ``<character>/recent.json``.
+"""Cross-process serialization for every read and write of ``<character>/recent.json``.
 
-This module is deliberately a leaf: it depends only on ``utils.file_utils``,
-``os`` and ``threading``. ``memory``, ``main_routers`` and ``utils`` can all
+This module is deliberately a leaf. ``memory``, ``main_routers`` and ``utils`` can all
 import it without dragging in the memory god-module and without inverting the
 dependency direction.
 
@@ -30,14 +29,26 @@ Both helpers block on file IO. Call them from a worker thread
 
 from __future__ import annotations
 
+import json
+import hashlib
+import math
 import os
+import re
+import stat
 import threading
+import tempfile
+import time
 from contextlib import contextmanager
 from typing import Any, Iterator
+
+from filelock import FileLock
 
 from utils.file_utils import atomic_write_json
 
 __all__ = [
+    "RECENT_IDEMPOTENCY_META_KEY",
+    "RETIRED_KEYS_FILENAME",
+    "VISIT_DIARY_KEY_RE",
     "RecentFileDeletedError",
     "RecentGenerationConflictError",
     "acquire_recent_file_locks",
@@ -46,6 +57,13 @@ __all__ = [
     "clear_recent_deletions",
     "clear_recent_redirects",
     "fence_recent_deletions_and_clear_redirects",
+    "keyed_entry_keys",
+    "prune_retired_keys",
+    "read_keyed_payload",
+    "strip_idempotency_metadata",
+    "read_retired_keys",
+    "read_retired_keys_unlocked",
+    "retire_removed_keyed_entries",
     "get_recent_pending",
     "get_recent_pending_unlocked",
     "get_recent_content_version_unlocked",
@@ -58,6 +76,7 @@ __all__ = [
     "restore_recent_deletions",
     "restore_recent_registry_state",
     "set_recent_pending_unlocked",
+    "subscribe_recent_changes",
     "snapshot_recent_redirects",
     "snapshot_recent_deletions",
     "mark_recent_deleted",
@@ -78,29 +97,71 @@ class RecentGenerationConflictError(RuntimeError):
 
 
 # ── per-path lock registry ────────────────────────────────────────────────
-# 锁按**文件路径**建，不按角色名：main_routers 那几个写者是按 filename 解析路径
-# 的（resolve_recent_file_path 还带 legacy 布局回退），它们拿不到「角色名 →
-# manager」的映射；而且两个角色误配到同一个文件时，按名字切的锁根本不互斥。
-# 资源的身份是文件。
+# Key locks by file path, not character name: main_routers writers resolve paths by filename,
+# including resolve_recent_file_path's legacy-layout fallback, and lack character-name-to-manager
+# mappings. Name-based locks also fail to exclude two characters misconfigured to share one file.
+# The file is the resource identity.
 #
-# 模块级而不是实例级：reload_memory_components 会构造新的
-# CompressedRecentHistoryManager，而旧实例上的 review / 后台压缩 task 还握着旧
-# 引用在跑。实例级的锁在那个窗口里零互斥。memory_server/runtime.py 特意复用
-# EventLog 实例，理由就是这个。
+# Module-level rather than instance-level: reload_memory_components constructs a new
+# CompressedRecentHistoryManager while old review/background-compression tasks retain old
+# references. Instance locks offer no exclusion during that window, the same reason memory_server/runtime.py
+# deliberately reuses EventLog instances.
 #
-# threading.Lock 而不是 asyncio.Lock：
-# 1) 要互斥的是 open() 与 os.replace() 两个 syscall，它们跑在 to_thread 的
-#    worker 线程上，asyncio 锁管不到跨线程；
-# 2) 模块级 asyncio.Lock 一旦真发生争用就绑定当时的 event loop。本仓库的 recent
-#    单测是一个用例一个 asyncio.run，第二个有争用的用例会直接 RuntimeError，而且
-#    失败后锁还残留成已持有状态；
-# 3) threading.Lock 把 json.dumps 也关进临界区（atomic_write_json 是先 dumps 再
-#    写），锁外残留的 mutation 撞不出 "dictionary changed size during iteration"。
-# 同一范式见 memory/event_log.py 与 app/memory_server/gates.py。
+# Use threading.Lock rather than asyncio.Lock:
+# 1) The mutually exclusive open() and os.replace() syscalls run in to_thread
+#    workers, beyond asyncio locks' cross-thread control.
+# 2) Module-level asyncio.Lock binds to the current loop on contention. Recent-history unit tests each
+#    use asyncio.run; the second contended test raises RuntimeError and leaves
+#    the failed lock held.
+# 3) threading.Lock also protects json.dumps (atomic_write_json serializes before
+#    writing), preventing residual concurrent mutations from changing dict size during iteration.
+# See the same pattern in memory/event_log.py and app/memory_server/gates.py.
 #
-# 故意不用 RLock：本模块所有 *_unlocked 函数都要求调用方已持锁，重入只会掩盖
-# 「嵌套 RMW 的内层落盘把外层改了一半的状态写进磁盘」这类真 bug。
-_LOCKS: dict[str, threading.Lock] = {}
+# Deliberately avoid RLock: every *_unlocked helper requires caller ownership; reentrancy would merely hide
+# bugs where an inner nested RMW persists the outer transaction's partially modified state.
+class _RecentFileLock:
+    """Keep thread exclusion and extend the same critical section across processes."""
+
+    def __init__(self, path):
+        self._thread = threading.Lock()
+        # Lock files must survive character moves/deletion without recreating
+        # deleted directories or colliding when two character folders merge.
+        key = hashlib.sha256(os.path.realpath(path).encode('utf-8')).hexdigest()
+        user = str(os.getuid()) if hasattr(os, 'getuid') else 'user'
+        self._file = FileLock(os.path.join(tempfile.gettempdir(), f'neko-recent-locks-{user}', key + '.lock'), thread_local=False)
+
+    def acquire(self):
+        self._thread.acquire()
+        try:
+            directory = os.path.dirname(self._file.lock_file)
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            info = os.lstat(directory)
+            if (not stat.S_ISDIR(info.st_mode) or (hasattr(os, 'getuid')
+                    and (info.st_uid != os.getuid() or info.st_mode & 0o077))):
+                raise PermissionError(f'unsafe recent lock directory: {directory}')
+            self._file.acquire()
+        except BaseException:
+            self._thread.release()
+            raise
+
+    def release(self):
+        try:
+            self._file.release()
+        finally:
+            self._thread.release()
+
+    def locked(self):
+        return self._thread.locked()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *_):
+        self.release()
+
+
+_LOCKS: dict[str, _RecentFileLock] = {}
 _LOCKS_GUARD = threading.Lock()
 _PENDING: dict[str, list[Any]] = {}
 _PENDING_GUARD = threading.Lock()
@@ -108,7 +169,19 @@ _REDIRECTS: dict[str, str] = {}
 _DELETED: set[str] = set()
 _GENERATIONS: dict[str, int] = {}
 _CONTENT_VERSIONS: dict[str, int] = {}
+_CHANGE_LISTENERS: set = set()
 _NEXT_GENERATION = 1
+
+
+def subscribe_recent_changes(callback):
+    """Subscribe a nonblocking hint after successful writes; return its cleanup."""
+    with _LOCKS_GUARD:
+        _CHANGE_LISTENERS.add(callback)
+
+    def unsubscribe():
+        with _LOCKS_GUARD:
+            _CHANGE_LISTENERS.discard(callback)
+    return unsubscribe
 
 
 def _lock_key(path: Any) -> str:
@@ -124,13 +197,13 @@ def _resolve_key_unlocked(key: str) -> str:
     return key
 
 
-def recent_file_lock(path: Any) -> threading.Lock:
+def recent_file_lock(path: Any) -> _RecentFileLock:
     """Return the process-wide lock guarding one recent.json path."""
     with _LOCKS_GUARD:
         key = _resolve_key_unlocked(_lock_key(path))
         lock = _LOCKS.get(key)
         if lock is None:
-            lock = threading.Lock()
+            lock = _RecentFileLock(key)
             _LOCKS[key] = lock
     return lock
 
@@ -165,7 +238,7 @@ def recent_file_access(
             resolved_key = _resolve_key_unlocked(original_key)
             lock = _LOCKS.get(resolved_key)
             if lock is None:
-                lock = threading.Lock()
+                lock = _RecentFileLock(resolved_key)
                 _LOCKS[resolved_key] = lock
         lock.acquire()
         with _LOCKS_GUARD:
@@ -198,7 +271,7 @@ def recent_file_locks(paths: list[Any]) -> Iterator[None]:
         release_recent_file_locks(locks)
 
 
-def acquire_recent_file_locks(paths: list[Any]) -> list[threading.Lock]:
+def acquire_recent_file_locks(paths: list[Any]) -> list[_RecentFileLock]:
     """Acquire physical path locks for a transaction spanning multiple calls."""
     original_keys = {_lock_key(path) for path in paths}
     while True:
@@ -212,7 +285,7 @@ def acquire_recent_file_locks(paths: list[Any]) -> list[threading.Lock]:
             for key in sorted(scoped_keys):
                 lock = _LOCKS.get(key)
                 if lock is None:
-                    lock = threading.Lock()
+                    lock = _RecentFileLock(key)
                     _LOCKS[key] = lock
                 locks.append(lock)
         for lock in locks:
@@ -229,7 +302,7 @@ def acquire_recent_file_locks(paths: list[Any]) -> list[threading.Lock]:
         release_recent_file_locks(locks)
 
 
-def release_recent_file_locks(locks: list[threading.Lock]) -> None:
+def release_recent_file_locks(locks: list[_RecentFileLock]) -> None:
     """Release locks returned by ``acquire_recent_file_locks``."""
     for lock in reversed(locks):
         lock.release()
@@ -452,11 +525,25 @@ def write_recent_payload_unlocked(path: Any, payload: Any) -> None:
     is the last statement in ``atomic_write_text`` and everything after it only
     cleans up the temp file. Callers rely on that to retry a failed batch without
     any deduplication.
+
+    Every rewrite of a recent file goes through here, so this is also where
+    keyed entries leaving the file are recorded: before the replace, the keys
+    of keyed entries present in the old file and absent from ``payload`` are
+    written to the ``RETIRED_KEYS_FILENAME`` sidecar
+    (:func:`retire_removed_keyed_entries`).
     """
+    retire_removed_keyed_entries(path, None, payload)
     atomic_write_json(path, payload, indent=2, ensure_ascii=False)
     with _LOCKS_GUARD:
         key = _resolve_key_unlocked(_lock_key(path))
         _CONTENT_VERSIONS[key] = _CONTENT_VERSIONS.get(key, 0) + 1
+        listeners = tuple(_CHANGE_LISTENERS)
+    for callback in listeners:
+        try:
+            callback(key)
+        except Exception:
+            # Optional hints must never turn a committed local save into a failure.
+            pass
 
 
 def recent_sidecar_path(path: Any, filename: str) -> str:
@@ -488,3 +575,170 @@ def write_recent_payload(
     ) as resolved_path:
         write_recent_payload_unlocked(resolved_path, payload)
         set_recent_pending_unlocked(resolved_path, [])
+
+
+# ── keyed entries leaving recent.json ─────────────────────────────────────
+# When keyed entries (visit diary records) leave recent.json through compression, trimming, clearing,
+# memory-browser saves, cloud replacement, etc., record their keys in a sidecar as positive evidence
+# they were written then removed. Keyed memory_server /cache retries treat them as written and never reinsert them.
+# Keep recent.json's list-root format unchanged.
+
+RETIRED_KEYS_FILENAME = "recent.retired_keys.json"
+"""Sidecar ``{key: retired_at}`` of keyed entries that left this recent file."""
+
+RECENT_IDEMPOTENCY_META_KEY = "idempotency_key"
+"""Message metadata key carrying the idempotency key of a keyed ``/cache`` write."""
+
+VISIT_DIARY_KEY_RE = re.compile(r"^visit-debrief:[A-Za-z0-9_-]{22}$")
+"""The only keyed recent entries: one visit's diary (an assistant message), ``visit-debrief:{visit_id}``."""
+
+_KEY_MARKER = '"' + RECENT_IDEMPOTENCY_META_KEY + '"'
+
+
+def _entry_key(entry: Any) -> str | None:
+    # Accept only visit diaries: AI messages with complete key formats. Same-named caller metadata on ordinary messages proves nothing.
+    if not isinstance(entry, dict):
+        return None
+    meta = entry.get("metadata")
+    if not isinstance(meta, dict):
+        data = entry.get("data")
+        meta = data.get("metadata") if isinstance(data, dict) else None
+    key = meta.get(RECENT_IDEMPOTENCY_META_KEY) if isinstance(meta, dict) else None
+    kind = entry.get("type") or ("ai" if entry.get("role") == "assistant" else entry.get("role"))
+    if kind != "ai" or not isinstance(key, str) or VISIT_DIARY_KEY_RE.fullmatch(key) is None:
+        return None
+    return key
+
+
+def strip_idempotency_metadata(messages: Any) -> None:
+    """Drop the reserved ``idempotency_key`` metadata from caller-supplied messages (in place).
+
+    Only the keyed ``/cache`` path stamps it, on the server side; anything a
+    caller sent on another write path would otherwise read as "this diary was
+    already written" and settle a later real keyed write without storing it.
+    """
+    for message in messages or ():
+        if isinstance(message, dict):
+            # Match _entry_key's accepted shapes: top-level metadata or persisted data.metadata; this leaf module does not import llm_client.
+            data = message.get("data")
+            metas = [message.get("metadata"), data.get("metadata") if isinstance(data, dict) else None]
+        else:
+            metas = [getattr(message, "metadata", None)]
+        for meta in metas:
+            if isinstance(meta, dict):
+                meta.pop(RECENT_IDEMPOTENCY_META_KEY, None)
+
+
+def keyed_entry_keys(payload: Any) -> set[str]:
+    """Idempotency keys of the keyed entries in a recent payload (a list of stored messages)."""
+    if not isinstance(payload, list):
+        return set()
+    return {key for key in (_entry_key(entry) for entry in payload) if key is not None}
+
+
+def _read_current_payload_unlocked(path: Any) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError):
+        # If the old file is unreadable or invalid UTF-8, removed keys cannot be compared, but replacement writes must proceed
+        # because cloud downloads intentionally overwrite corrupt recent.json files.
+        return []
+    if _KEY_MARKER not in text:
+        # Most files contain no keyed entries; detect that without parsing.
+        return []
+    try:
+        return json.loads(text)
+    except (ValueError, RecursionError):
+        # Corrupt old files cannot identify removed keys; write normally, since no entries were readable anyway.
+        return []
+
+
+def read_keyed_payload(path: Any) -> Any:
+    """A recent payload read only for its keyed entries (``[]`` when absent, unreadable or without any).
+
+    No lock: for files outside the live recent path (e.g. a staged cloud copy).
+    """
+    return _read_current_payload_unlocked(path)
+
+
+def read_retired_keys_unlocked(path: Any) -> dict[str, float]:
+    """The retired-key sidecar of ``path`` (``{}`` when absent). The caller MUST hold the lock.
+
+    Raises ``ValueError`` when the sidecar exists but is not a JSON object,
+    and ``OSError`` when it cannot be read: callers deciding "was this key
+    ever written" must not read a damaged file as "never".
+    """
+    sidecar = recent_sidecar_path(path, RETIRED_KEYS_FILENAME)
+    try:
+        with open(sidecar, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{RETIRED_KEYS_FILENAME} is not an object")
+    for key, stamp in data.items():
+        # Also treat malformed entries, invalid diary keys or nonfinite timestamps as corrupt, never as proof of prior writes.
+        if (
+            not isinstance(key, str) or VISIT_DIARY_KEY_RE.fullmatch(key) is None
+            or isinstance(stamp, bool) or not isinstance(stamp, (int, float))
+            # All ints are finite; math.isfinite over huge ints raises OverflowError and blocks recent.json writes, so check floats only.
+            or (isinstance(stamp, float) and not math.isfinite(stamp))
+        ):
+            raise ValueError(f"{RETIRED_KEYS_FILENAME} has a malformed entry")
+    return data
+
+
+def read_retired_keys(path: Any) -> dict[str, float]:
+    """:func:`read_retired_keys_unlocked` under the file lock."""
+    with recent_file_access(path) as resolved_path:
+        return read_retired_keys_unlocked(resolved_path)
+
+
+def retire_removed_keyed_entries(path: Any, old: Any, new: Any) -> list[str]:
+    """Record the keys of keyed entries in ``old`` but not in ``new``. The caller MUST hold the lock.
+
+    ``old=None`` reads the current file. The sidecar is written atomically
+    BEFORE the caller replaces (or deletes, ``new=[]``) the recent file: a
+    crash between the two leaves the key recorded and the entry possibly
+    still there, both evidence that it was written. A key already recorded
+    keeps its first ``retired_at``. A sidecar that cannot be read is left
+    untouched (its readers keep failing closed) rather than replaced by an
+    incomplete one. Returns the newly retired keys.
+    """
+    if old is None:
+        old = _read_current_payload_unlocked(path)
+    removed = keyed_entry_keys(old) - keyed_entry_keys(new)
+    if not removed:
+        return []
+    try:
+        data = read_retired_keys_unlocked(path)
+    except (OSError, ValueError, RecursionError):
+        # Corrupt/unreadable sidecars must not block recent.json writes, but do not overwrite them with a new sidecar containing only these entries;
+        # that loses old-key evidence and lets retries restore removed diaries. Retain unchanged and fail closed on keyed reads.
+        return []
+    now = time.time()
+    added = sorted(key for key in removed if key not in data)
+    if not added:
+        return []
+    for key in added:
+        data[key] = now
+    write_recent_sidecar_unlocked(path, RETIRED_KEYS_FILENAME, data)
+    return added
+
+
+def prune_retired_keys(path: Any, should_drop) -> list[str]:
+    """Drop sidecar records for which ``should_drop(key, retired_at)`` is true (under the file lock)."""
+    with recent_file_access(path) as resolved_path:
+        sidecar = recent_sidecar_path(resolved_path, RETIRED_KEYS_FILENAME)
+        if not os.path.exists(sidecar):
+            return []
+        data = read_retired_keys_unlocked(resolved_path)
+        dropped = [key for key, stamp in data.items() if should_drop(key, stamp)]
+        if dropped:
+            for key in dropped:
+                data.pop(key, None)
+            write_recent_sidecar_unlocked(resolved_path, RETIRED_KEYS_FILENAME, data)
+        return dropped
